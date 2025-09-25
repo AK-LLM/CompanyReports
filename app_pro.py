@@ -1,4 +1,4 @@
-# app_pro.py — Fully revised and sanity-checked
+# app_pro.py — Revised with smart flags & forensics (sanity-checked)
 import io
 import math
 import time
@@ -34,7 +34,7 @@ def sanitize_for_excel(df: pd.DataFrame) -> pd.DataFrame:
         # Convert nested containers to strings
         if df[col].apply(lambda x: isinstance(x, (list, dict, tuple, set))).any():
             df[col] = df[col].astype(str)
-    # Replace infinities (Excel can't)
+    # Replace infinities
     df.replace({np.inf: np.nan, -np.inf: np.nan}, inplace=True)
     return df
 
@@ -52,7 +52,7 @@ def _safe_float(x) -> Optional[float]:
 
 
 def _pick_row(df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
-    """Find first matching row (case-insensitive contains) and return the row (newest first)."""
+    """Find first matching row (case-insensitive contains) and return the row series newest→oldest."""
     if not isinstance(df, pd.DataFrame) or df.empty:
         return None
     idx_lower = pd.Index(df.index.astype(str).str.lower())
@@ -64,11 +64,23 @@ def _pick_row(df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
     return None
 
 
-def _latest_value(df: pd.DataFrame, candidates: List[str]) -> Optional[float]:
+def _series(df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
     row = _pick_row(df, candidates)
-    if row is None or len(row) == 0:
+    return row if (row is not None and len(row) > 0) else None
+
+
+def _latest_value(df: pd.DataFrame, candidates: List[str]) -> Optional[float]:
+    row = _series(df, candidates)
+    if row is None:
         return None
     return _safe_float(row.iloc[0])
+
+
+def _latest_prev(df: pd.DataFrame, candidates: List[str]) -> Tuple[Optional[float], Optional[float]]:
+    row = _series(df, candidates)
+    if row is None or len(row) < 2:
+        return None, None
+    return _safe_float(row.iloc[0]), _safe_float(row.iloc[1])
 
 
 # ============================
@@ -167,7 +179,7 @@ def fetch_all(ticker: str, hist_period: str = "1y") -> Tuple[dict, pd.DataFrame,
         except Exception:
             pass
 
-    # Financial statements (safe helpers that never rely on DF truthiness)
+    # Financial statements (helpers never rely on DF truthiness)
     def _get_attr(name: str) -> pd.DataFrame:
         try:
             df = getattr(t, name)
@@ -190,6 +202,16 @@ def fetch_all(ticker: str, hist_period: str = "1y") -> Tuple[dict, pd.DataFrame,
     hist = _with_retries(_hist)
 
     return info, income, balance, cashflw, hist
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_history_only(ticker: str, hist_period: str = "1y") -> pd.DataFrame:
+    """Only price history; used for benchmark/RS."""
+    try:
+        df = yf.Ticker(ticker).history(period=hist_period, auto_adjust=False)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 
 # ============================
@@ -260,13 +282,20 @@ def build_core(ticker: str, info: dict, inc: pd.DataFrame, bal: pd.DataFrame, cf
     if c.ebit and int_exp:
         c.int_cov = c.ebit / abs(int_exp) if int_exp else None
 
-    # ROIC (approx): NOPAT / (Equity + Debt - Cash)
-    nopat = (c.ebit * 0.79) if c.ebit else None  # ~21% tax proxy
-    invested_cap = None
-    if c.equity is not None or c.debt is not None:
-        invested_cap = (c.equity or 0) + (c.debt or 0) - (c.cash or 0)
-    if nopat and invested_cap:
-        c.roic = nopat / invested_cap if invested_cap else None
+    # ROIC (avg invested capital over two periods)
+    assets_t, assets_p = _latest_prev(bal, ["total assets"])
+    equity_t, equity_p = _latest_prev(bal, ["total stockholder", "total shareholders'", "total equity"])
+    debt_t, debt_p = _latest_prev(bal, ["total debt", "long term debt", "long-term debt"])
+    cash_t, cash_p = _latest_prev(bal, ["cash", "cash and cash equivalents", "cash and short term investments"])
+    if c.ebit and assets_t and (equity_t is not None) and (debt_t is not None) and (cash_t is not None):
+        ic_t = (equity_t or 0) + (debt_t or 0) - (cash_t or 0)
+        ic_p = None
+        if (equity_p is not None) or (debt_p is not None) or (cash_p is not None):
+            ic_p = (equity_p or 0) + (debt_p or 0) - (cash_p or 0)
+        avg_ic = (ic_t + ic_p) / 2 if ic_p is not None else ic_t
+        nopat = c.ebit * 0.79
+        if avg_ic and avg_ic > 0:
+            c.roic = nopat / avg_ic
 
     # FCF yield
     if c.fcf and c.mktcap:
@@ -277,16 +306,15 @@ def build_core(ticker: str, info: dict, inc: pd.DataFrame, bal: pd.DataFrame, cf
     ap = _latest_value(bal, ["accounts payable"])
     cogs = _latest_value(inc, ["cost of revenue", "cost of goods sold"])
     if c.revenue and cogs and ar and ap and c.inventory:
-        AR_days = (ar / (c.revenue / 365.0)) if c.revenue else None
-        INV_days = (c.inventory / (cogs / 365.0)) if cogs else None
-        AP_days = (ap / (cogs / 365.0)) if cogs else None
-        if AR_days and INV_days and AP_days:
-            c.ccc = AR_days + INV_days - AP_days
+        AR_days = ar / (c.revenue / 365.0)
+        INV_days = c.inventory / (cogs / 365.0)
+        AP_days = ap / (cogs / 365.0)
+        c.ccc = AR_days + INV_days - AP_days
 
     return c
 
 
-def momentum_and_prices(hist: pd.DataFrame) -> Tuple[Dict[str, float], pd.DataFrame]:
+def momentum_and_prices(hist: pd.DataFrame, bench_hist: pd.DataFrame = None) -> Tuple[Dict[str, float], pd.DataFrame]:
     out: Dict[str, float] = {}
     if not isinstance(hist, pd.DataFrame) or hist.empty:
         return out, pd.DataFrame()
@@ -307,6 +335,21 @@ def momentum_and_prices(hist: pd.DataFrame) -> Tuple[Dict[str, float], pd.DataFr
     out["price"] = float(close.iloc[-1])
     out["hi_52w"] = float(close.tail(252).max()) if len(close) >= 252 else None
     out["px_vs_52w_hi"] = (out["price"] / out["hi_52w"] - 1.0) if (out.get("price") and out.get("hi_52w")) else None
+
+    # Volatility (annualized) & Max drawdown
+    daily = close.pct_change().dropna()
+    out["vol_1y"] = float(daily.std() * np.sqrt(252)) if not daily.empty else None
+    roll_max = close.cummax()
+    dd = (close / roll_max - 1.0).min() if not close.empty else None
+    out["max_dd_1y"] = float(dd) if dd is not None else None
+
+    # Relative strength vs benchmark (SPY by default)
+    if isinstance(bench_hist, pd.DataFrame) and not bench_hist.empty and "Close" in bench_hist:
+        b = bench_hist["Close"].reindex(close.index).ffill().dropna()
+        if not b.empty and len(b) == len(close):
+            rs = (close / b)
+            out["rs_6m"] = float(rs.iloc[-1] / rs.shift(126).dropna().iloc[-1] - 1.0) if len(rs) >= 127 else None
+            out["rs_12m"] = float(rs.iloc[-1] / rs.shift(252).dropna().iloc[-1] - 1.0) if len(rs) >= 253 else None
 
     df = pd.DataFrame({"Date": close.index, "Close": close.values, "SMA50": sma50.values, "SMA200": sma200.values})
     return out, df
@@ -352,37 +395,136 @@ def simple_score(core: Core, mom: Dict[str, float]) -> Tuple[float, Dict[str, fl
 
 
 # ============================
-# Peer medians
+# Piotroski F-Score (partial when data missing)
 # ============================
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def peer_medians(peers: List[str]) -> Dict[str, float]:
-    meds: Dict[str, float] = {}
-    if not peers:
-        return meds
+def piotroski_f(inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFrame):
+    """Return (score, available_checks, details list[(name, True/False)])."""
+    details = []
+    available = 0
+    score = 0
 
-    def _grab(tk: str):
-        info, inc, bal, cfs, _ = fetch_all(tk, "1y")
-        c = build_core(tk, info, inc, bal, cfs)
-        return {
-            "P/E": c.pe, "EV/EBITDA": c.ev_ebitda, "P/S": c.ps, "P/B": c.pb,
-            "Debt/Equity": c.de, "FCF Yield": c.fcf_yield, "ROIC": c.roic
-        }
+    ni_t, ni_p = _latest_prev(inc, ["net income"])
+    assets_t, assets_p = _latest_prev(bal, ["total assets"])
+    cfo_t, cfo_p = _latest_prev(cfs, ["operating cash flow", "total cash from operating activities"])
+    long_debt_t, long_debt_p = _latest_prev(bal, ["long term debt", "long-term debt", "total debt"])
+    curr_as_t, curr_as_p = _latest_prev(bal, ["total current assets"])
+    curr_li_t, curr_li_p = _latest_prev(bal, ["total current liabilities"])
+    gross_t, gross_p = _latest_prev(inc, ["gross profit"])
+    sales_t, sales_p = _latest_prev(inc, ["total revenue", "revenue"])
 
-    rows = []
-    with ThreadPoolExecutor(max_workers=min(5, len(peers))) as ex:
-        futs = [ex.submit(_grab, p) for p in peers]
-        for f in as_completed(futs):
-            try:
-                rows.append(f.result())
-            except Exception:
-                pass
+    # 1) ROA positive
+    if ni_t is not None and assets_t:
+        available += 1
+        ok = (ni_t / assets_t) > 0
+        score += int(ok); details.append(("ROA positive", ok))
+    # 2) CFO positive
+    if cfo_t is not None:
+        available += 1
+        ok = cfo_t > 0
+        score += int(ok); details.append(("CFO positive", ok))
+    # 3) Accruals: CFO > NI
+    if cfo_t is not None and ni_t is not None:
+        available += 1
+        ok = cfo_t > ni_t
+        score += int(ok); details.append(("Accruals (CFO>NI)", ok))
+    # 4) Leverage decreasing
+    if long_debt_t is not None and long_debt_p is not None and assets_t:
+        available += 1
+        ok = (long_debt_t / assets_t) <= (long_debt_p / (assets_p or assets_t))
+        score += int(ok); details.append(("Leverage improving", ok))
+    # 5) Liquidity improving
+    if curr_as_t and curr_li_t and curr_as_p and curr_li_p:
+        available += 1
+        ok = (curr_as_t / curr_li_t) >= (curr_as_p / curr_li_p)
+        score += int(ok); details.append(("Current ratio improving", ok))
+    # 6) No new shares issued (skipped: lack of share history)
+    # 7) Gross margin improving
+    if gross_t and sales_t and gross_p and sales_p:
+        available += 1
+        ok = (gross_t / sales_t) >= (gross_p / sales_p)
+        score += int(ok); details.append(("Gross margin improving", ok))
+    # 8) Asset turnover improving
+    if sales_t and sales_p and assets_t and assets_p:
+        available += 1
+        ok = (sales_t / assets_t) >= (sales_p / assets_p)
+        score += int(ok); details.append(("Asset turnover improving", ok))
 
-    if not rows:
-        return meds
-    df = pd.DataFrame(rows)
-    meds = df.median(numeric_only=True).to_dict()
-    return meds
+    return score, available, details
+
+
+# ============================
+# Smart forensic flags
+# ============================
+
+def smart_flags(core: Core, inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFrame, mom: Dict[str, float]):
+    """Return list of dicts: {'level': 'red'|'orange'|'info', 'title': ..., 'detail': ...}."""
+    flags: List[Dict[str, str]] = []
+
+    def add(level: str, title: str, detail: str):
+        flags.append({"level": level, "title": title, "detail": detail})
+
+    # Data sufficiency
+    if core.revenue is None or core.ebit is None or core.equity is None:
+        add("info", "Missing key lines", "Some statements lacked rows (Revenue/EBIT/Equity). Trend scores may be limited.")
+
+    # Earnings quality
+    cfo = _latest_value(cfs, ["operating cash flow", "total cash from operating activities"])
+    if core.net_income and cfo is not None and cfo < 0 <= core.net_income:
+        add("red", "Earnings quality risk", "Positive net income but negative operating cash flow in latest period.")
+
+    # Receivables vs Sales growth (Beneish-lite DSRI)
+    ar_t, ar_p = _latest_prev(bal, ["accounts receivable"])
+    sales_t, sales_p = _latest_prev(inc, ["total revenue", "revenue"])
+    if ar_t and sales_t and ar_p and sales_p and sales_p != 0 and sales_t != 0:
+        dsri = (ar_t / sales_t) / (ar_p / sales_p)
+        if dsri > 1.4:
+            add("orange", "Receivables outpacing sales", "DSRI > 1.4; watch for aggressive revenue recognition.")
+
+    # Inventory growth vs Sales
+    inv_t, inv_p = _latest_prev(bal, ["inventory"])
+    if inv_t and inv_p and sales_t and sales_p and sales_p != 0:
+        inv_growth = (inv_t - inv_p) / abs(inv_p) if inv_p != 0 else None
+        sales_growth = (sales_t - sales_p) / abs(sales_p) if sales_p != 0 else None
+        if inv_growth is not None and sales_growth is not None and inv_growth > sales_growth * 1.5 and inv_growth > 0.3:
+            add("orange", "Inventory build-up", "Inventory growing much faster than sales; potential obsolescence risk.")
+
+    # Goodwill intensity
+    assets = _latest_value(bal, ["total assets"])
+    if core.goodwill and assets and core.goodwill / assets > 0.4:
+        add("orange", "High goodwill share of assets", ">40% of assets are goodwill; future impairments possible.")
+
+    # Liquidity
+    if core.current_ratio and core.current_ratio < 1.0:
+        add("orange", "Tight liquidity", "Current ratio < 1.0")
+    if core.quick_ratio and core.quick_ratio < 1.0:
+        add("orange", "Low quick ratio", "Quick ratio < 1.0")
+
+    # Leverage & coverage
+    if core.de and core.de > 2.0:
+        add("orange", "High leverage", "Debt/Equity > 2")
+    if core.int_cov and core.int_cov < 2.0:
+        add("orange", "Weak interest coverage", "EBIT/Interest < 2")
+
+    # Profitability stress
+    gm = (core.gross_profit / core.revenue) if (core.gross_profit and core.revenue) else None
+    if gm is not None and gm < 0.15:
+        add("orange", "Thin gross margin", "Gross margin < 15%")
+    if core.ebitda and core.revenue and core.ebitda / core.revenue < 0.05:
+        add("orange", "Low EBITDA margin", "EBITDA margin < 5%")
+
+    # Momentum risk
+    if mom.get("max_dd_1y") is not None and mom["max_dd_1y"] < -0.3:
+        add("orange", "Deep drawdown", "Max drawdown worse than -30% in last year.")
+    if mom.get("vol_1y") is not None and mom["vol_1y"] > 0.6:
+        add("info", "Very high volatility", "Annualized volatility > 60%")
+
+    # Industry-specific note
+    industry_txt = (core.industry or "") + " " + (core.sector or "")
+    if any(x in industry_txt.lower() for x in ["bank", "insurance", "reit"]):
+        add("info", "Industry template", "Bank/Insurance/REIT metrics may need FFO/Net Interest metrics; EV/EBITDA less meaningful.")
+
+    return flags
 
 
 # ============================
@@ -435,26 +577,21 @@ def simple_dcf(core: Core, rf: float, mkt_prem: float, term_growth: float, years
     return df, per_share or 0.0
 
 
-def dcf_sensitivity(core: Core, rf: float, prem_list: List[float], g_list: List[float]) -> List[Dict]:
-    rows = []
-    for prem in prem_list:
-        for g in g_list:
-            _, ps = simple_dcf(core, rf, prem, g, years=5)
-            rows.append({"MktPrem": prem, "TerminalG": g, "Price/Share": ps})
-    return rows
-
-
 # ============================
 # Analysis wrappers
 # ============================
 
 def analyze_one(ticker: str, hist_period: str, rf: float, mkt_prem: float, term_g: float):
     info, inc, bal, cfs, hist = fetch_all(ticker, hist_period)
+    bench_hist = fetch_history_only("SPY", hist_period)
     core = build_core(ticker, info, inc, bal, cfs)
-    mom, price_df = momentum_and_prices(hist)
+    mom, price_df = momentum_and_prices(hist, bench_hist)
     score, parts, verdict = simple_score(core, mom)
 
     dcf_table, dcf_px = simple_dcf(core, rf, mkt_prem, term_g, years=5)
+    f_score, f_avail, f_details = piotroski_f(inc, bal, cfs)
+    flags = smart_flags(core, inc, bal, cfs, mom)
+
     cap = {
         "Market Cap": core.mktcap,
         "Enterprise Value": core.ev,
@@ -463,7 +600,7 @@ def analyze_one(ticker: str, hist_period: str, rf: float, mkt_prem: float, term_
         "Net Debt": (core.debt or 0) - (core.cash or 0),
         "Shares Out": core.shares_out
     }
-    return core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px
+    return core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px, f_score, f_avail, f_details, flags
 
 
 def _fmt(v, pct=False):
@@ -482,7 +619,7 @@ def _fmt(v, pct=False):
 # ============================
 
 st.title("🧠 Naked Fundamentals PRO — Streamlit")
-st.caption("Fundamentals • Value/Quality/Momentum • Peer medians • DCF • Export")
+st.caption("Fundamentals • Value/Quality/Momentum • Peer medians • DCF • Forensics & Smart Flags • Export")
 
 with st.sidebar:
     st.header("Controls")
@@ -519,7 +656,9 @@ if mode == "Single Ticker":
         st.stop()
 
     with st.spinner(f"Fetching {tk1}..."):
-        core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px = analyze_one(tk1, hist_period, rf, mkt_prem, term_g)
+        core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px, f_score, f_avail, f_details, flags = analyze_one(
+            tk1, hist_period, rf, mkt_prem, term_g
+        )
 
     # Header
     st.subheader(f"{tk1} — {core.name or ''}")
@@ -544,7 +683,15 @@ if mode == "Single Ticker":
         fig = px.line(price_df, x="Date", y=["Close", "SMA50", "SMA200"])
         st.plotly_chart(fig, use_container_width=True)
 
-    # Fundamentals table
+    # Momentum extras
+    st.markdown("### Momentum Extras")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Vol (ann.)", _fmt(mom.get("vol_1y")))
+    m2.metric("Max DD (1y)", _fmt(mom.get("max_dd_1y"), pct=True))
+    m3.metric("RS vs SPY (6m)", _fmt(mom.get("rs_6m"), pct=True) if mom.get("rs_6m") is not None else "—")
+    m4.metric("RS vs SPY (12m)", _fmt(mom.get("rs_12m"), pct=True) if mom.get("rs_12m") is not None else "—")
+
+    # Key Fundamentals
     st.markdown("### Key Fundamentals")
     rows = [
         ("Sector", core.sector),
@@ -571,12 +718,49 @@ if mode == "Single Ticker":
     cap_df = pd.DataFrame({"Metric": list(cap.keys()), "Value": list(cap.values())})
     st.dataframe(cap_df, use_container_width=True)
 
+    # Forensics — Piotroski & Flags
+    st.markdown("### Forensics")
+    fcol1, fcol2 = st.columns([1, 2])
+    fcol1.metric("Piotroski F-Score", f"{f_score}/{f_avail}" if f_avail else "—")
+    if f_avail:
+        f_tbl = pd.DataFrame([{"Check": n, "Pass": "✅" if ok else "❌"} for n, ok in f_details])
+        fcol1.dataframe(f_tbl, use_container_width=True, hide_index=True)
+
+    # Smart Flags
+    if flags:
+        sev_map = {"red": "🔴", "orange": "🟠", "info": "🔵"}
+        flags_df = pd.DataFrame([{
+            "Severity": sev_map.get(f["level"], "🔵"),
+            "Flag": f["title"],
+            "Details": f["detail"]
+        } for f in flags])
+        fcol2.dataframe(flags_df, use_container_width=True, hide_index=True)
+    else:
+        fcol2.info("No red/orange flags detected with current data.")
+
     # Peer Medians
     if peer_str.strip():
         st.markdown("### Peer Medians")
         peers = sorted({p.strip().upper() for p in peer_str.split(",") if p.strip()})
         with st.spinner("Fetching peers..."):
-            meds = peer_medians(peers)
+            meds = {}
+            try:
+                @st.cache_data(ttl=3600, show_spinner=False)
+                def peer_medians(peers_list: List[str]) -> Dict[str, float]:
+                    rows = []
+                    for p in peers_list:
+                        info, inc, bal, cfs, _ = fetch_all(p, "1y")
+                        c = build_core(p, info, inc, bal, cfs)
+                        rows.append({
+                            "P/E": c.pe, "EV/EBITDA": c.ev_ebitda, "P/S": c.ps, "P/B": c.pb,
+                            "Debt/Equity": c.de, "FCF Yield": c.fcf_yield, "ROIC": c.roic
+                        })
+                    if not rows:
+                        return {}
+                    return pd.DataFrame(rows).median(numeric_only=True).to_dict()
+                meds = peer_medians(peers)
+            except Exception:
+                meds = {}
         if meds:
             bench = pd.DataFrame([
                 {"Metric": "P/E", "Company": core.pe, "Peers (Median)": meds.get("P/E")},
@@ -589,7 +773,7 @@ if mode == "Single Ticker":
             ])
             st.dataframe(bench, use_container_width=True)
         else:
-            st.info("No peer data available right now (Yahoo may be rate-limiting).")
+            st.info("No peer data available right now (source may be rate-limiting).")
 
     # DCF
     st.markdown("### DCF (simple)")
@@ -597,8 +781,12 @@ if mode == "Single Ticker":
     if dcf_px:
         st.info(f"**DCF Fair Value (approx)**: {_fmt(dcf_px)} per share")
 
-    # Sensitivity
-    rows = dcf_sensitivity(core, rf, prem_list=[0.045, 0.055, 0.065], g_list=[0.015, 0.02, 0.025])
+    # Sensitivity (small grid)
+    rows = []
+    for prem in [0.045, 0.055, 0.065]:
+        for g in [0.015, 0.02, 0.025]:
+            _, ps = simple_dcf(core, rf, prem, g, years=5)
+            rows.append({"MktPrem": prem, "TerminalG": g, "Price/Share": ps})
     sens_df = pd.DataFrame(rows)
     st.markdown("**DCF Sensitivity (Market Premium × Terminal Growth)**")
     st.dataframe(sens_df, use_container_width=True)
@@ -612,6 +800,17 @@ if mode == "Single Ticker":
             sanitize_for_excel(cap_df).to_excel(writer, index=False, sheet_name="CapitalAlloc")
             sanitize_for_excel(dcf_table).to_excel(writer, index=False, sheet_name="DCF")
             sanitize_for_excel(sens_df).to_excel(writer, index=False, sheet_name="Sensitivity")
+            if f_avail:
+                ftbl = pd.DataFrame([{"Check": n, "Pass": bool(ok)} for n, ok in f_details])
+                sanitize_for_excel(ftbl).to_excel(writer, index=False, sheet_name="Piotroski")
+            if flags:
+                sev_map = {"red": "RED", "orange": "ORANGE", "info": "INFO"}
+                flag_df = pd.DataFrame([{
+                    "Severity": sev_map.get(f["level"], "INFO"),
+                    "Flag": f["title"],
+                    "Details": f["detail"]
+                } for f in flags])
+                sanitize_for_excel(flag_df).to_excel(writer, index=False, sheet_name="Flags")
             if not price_df.empty:
                 pdf = price_df.copy()
                 if "Date" in pdf.columns and pd.api.types.is_datetime64_any_dtype(pdf["Date"]):
@@ -649,7 +848,7 @@ else:
                 if isinstance(res, Exception):
                     st.error(f"{tk}: {res}")
                     continue
-                core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px = res
+                core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px, f_score, f_avail, f_details, flags = res
                 results.append({
                     "Ticker": tk,
                     "Name": core.name,
@@ -660,7 +859,9 @@ else:
                     "EV/EBITDA": core.ev_ebitda,
                     "D/E": core.de,
                     "FCF Yield": core.fcf_yield,
-                    "ROIC": core.roic
+                    "ROIC": core.roic,
+                    "F-Score": f"{f_score}/{f_avail}" if f_avail else "—",
+                    "Flags (red/orange)": sum(1 for fl in (flags or []) if fl["level"] in ("red","orange"))
                 })
                 if not price_df.empty:
                     charts.append((tk, price_df))
