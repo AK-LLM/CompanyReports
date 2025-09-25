@@ -1,3 +1,4 @@
+# app_pro.py — Fully revised and sanity-checked
 import io
 import math
 import time
@@ -23,7 +24,6 @@ def sanitize_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     df = df.copy()
-    # Drop timezone from datetime-like columns
     for col in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             try:
@@ -31,10 +31,10 @@ def sanitize_for_excel(df: pd.DataFrame) -> pd.DataFrame:
                     df[col] = df[col].dt.tz_localize(None)
             except Exception:
                 df[col] = pd.to_datetime(df[col], errors="coerce").dt.tz_localize(None)
-        # Convert containers to string
+        # Convert nested containers to strings
         if df[col].apply(lambda x: isinstance(x, (list, dict, tuple, set))).any():
             df[col] = df[col].astype(str)
-    # Replace infinities
+    # Replace infinities (Excel can't)
     df.replace({np.inf: np.nan, -np.inf: np.nan}, inplace=True)
     return df
 
@@ -52,14 +52,14 @@ def _safe_float(x) -> Optional[float]:
 
 
 def _pick_row(df: pd.DataFrame, candidates: List[str]) -> Optional[pd.Series]:
-    """Find first matching row (case-insensitive contains) and return the row series with most-recent value first."""
+    """Find first matching row (case-insensitive contains) and return the row (newest first)."""
     if not isinstance(df, pd.DataFrame) or df.empty:
         return None
-    idx = df.index.astype(str).str.lower()
+    idx_lower = pd.Index(df.index.astype(str).str.lower())
     for name in candidates:
-        m = idx.str.contains(name.lower(), regex=False)
-        if m.any():
-            s = df.loc[idx[m]].iloc[0]
+        mask = idx_lower.str.contains(name.lower(), regex=False)
+        if mask.any():
+            s = df.loc[mask].iloc[0]
             return s.dropna()
     return None
 
@@ -72,7 +72,7 @@ def _latest_value(df: pd.DataFrame, candidates: List[str]) -> Optional[float]:
 
 
 # ============================
-# Data Models
+# Data model
 # ============================
 
 @dataclass
@@ -119,7 +119,7 @@ class Core:
 
 
 # ============================
-# Yahoo Fetch (fast & robust)
+# Yahoo fetch (fast & robust)
 # ============================
 
 def _with_retries(fn, attempts=3, delay=0.5):
@@ -138,7 +138,7 @@ def fetch_all(ticker: str, hist_period: str = "1y") -> Tuple[dict, pd.DataFrame,
     t = yf.Ticker(ticker)
 
     # Fast info first
-    info = {}
+    info: Dict = {}
     try:
         fi = getattr(t, "fast_info", {}) or {}
         if fi:
@@ -167,26 +167,33 @@ def fetch_all(ticker: str, hist_period: str = "1y") -> Tuple[dict, pd.DataFrame,
         except Exception:
             pass
 
-    # Financials (wrap with retries)
-    def _get_attr(name):
-        return getattr(t, name, pd.DataFrame())
+    # Financial statements (safe helpers that never rely on DF truthiness)
+    def _get_attr(name: str) -> pd.DataFrame:
+        try:
+            df = getattr(t, name)
+            return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
 
-    income = _with_retries(lambda: _get_attr("financials") or pd.DataFrame())
-    balance = _with_retries(lambda: _get_attr("balance_sheet") or pd.DataFrame())
-    cashflw = _with_retries(lambda: _get_attr("cashflow") or pd.DataFrame())
+    income = _with_retries(lambda: _get_attr("financials"))
+    balance = _with_retries(lambda: _get_attr("balance_sheet"))
+    cashflw = _with_retries(lambda: _get_attr("cashflow"))
 
     # Price history
-    hist = pd.DataFrame()
-    try:
-        hist = _with_retries(lambda: t.history(period=hist_period, auto_adjust=False) or pd.DataFrame())
-    except Exception:
-        pass
+    def _hist() -> pd.DataFrame:
+        try:
+            df = t.history(period=hist_period, auto_adjust=False)
+            return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    hist = _with_retries(_hist)
 
     return info, income, balance, cashflw, hist
 
 
 # ============================
-# Feature Calculations
+# Feature calculations
 # ============================
 
 def build_core(ticker: str, info: dict, inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFrame) -> Core:
@@ -223,25 +230,21 @@ def build_core(ticker: str, info: dict, inc: pd.DataFrame, bal: pd.DataFrame, cf
     c.fcf = _latest_value(cfs, ["free cash flow", "free cash flow to the firm"])
 
     # Ratios
-    # P/S and P/B depend only on market cap and fundamentals (not price/shares directly)
     if c.mktcap and c.revenue:
         c.ps = c.mktcap / c.revenue
     if c.mktcap and c.equity:
         c.pb = c.mktcap / c.equity
 
-    # P/E via EPS
     if c.price and c.shares_out and c.net_income:
         eps = c.net_income / c.shares_out if c.shares_out else None
         c.pe = (c.price / eps) if (eps and eps != 0) else None
 
-    # EV and EV/EBITDA
     if c.mktcap is not None:
         net_debt = (c.debt or 0) - (c.cash or 0)
         c.ev = c.mktcap + net_debt
     if c.ev and c.ebitda:
         c.ev_ebitda = c.ev / c.ebitda
 
-    # Leverage & Liquidity
     if c.debt is not None and c.equity:
         c.de = c.debt / c.equity if c.equity else None
     if c.current_assets and c.current_liab:
@@ -320,7 +323,7 @@ def simple_score(core: Core, mom: Dict[str, float]) -> Tuple[float, Dict[str, fl
     if core.ev_ebitda and core.ev_ebitda > 0:
         v += max(0, min(20, (20 - core.ev_ebitda))) / 20 * 20
     if core.fcf_yield:
-        v += max(0, min(25, core.fcf_yield * 100))
+        v += max(0, min(25, core.fcf_yield * 100))  # FCF yield in %
     parts["Value"] = v
 
     # Quality: ROIC, leverage, interest coverage
@@ -342,13 +345,14 @@ def simple_score(core: Core, mom: Dict[str, float]) -> Tuple[float, Dict[str, fl
         m += 10 if mom["sma50"] >= mom["sma200"] else 0
     parts["Momentum"] = m
 
-    score = sum(parts.values())
+    raw = sum(parts.values())
+    score = min(100.0, raw)   # cap to 100 for display
     verdict = "BUY" if score >= 65 else ("HOLD" if score >= 45 else "SELL")
     return score, parts, verdict
 
 
 # ============================
-# Peer Medians
+# Peer medians
 # ============================
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -441,7 +445,7 @@ def dcf_sensitivity(core: Core, rf: float, prem_list: List[float], g_list: List[
 
 
 # ============================
-# One-ticker analysis
+# Analysis wrappers
 # ============================
 
 def analyze_one(ticker: str, hist_period: str, rf: float, mkt_prem: float, term_g: float):
@@ -501,7 +505,7 @@ with st.sidebar:
     peer_str = st.text_input("Peers (comma-separated, optional)", "")
     st.caption("Tip: add peers to compute medians for P/E, EV/EBITDA, FCF Yield, ROIC, etc.")
 
-    # versions
+    # environment readout
     try:
         import sys
         st.caption(f"Py {sys.version.split()[0]} • pandas {pd.__version__} • numpy {np.__version__} • yfinance {getattr(yf, '__version__','?')}")
@@ -532,7 +536,7 @@ if mode == "Single Ticker":
     c2.metric("Value", f"{parts.get('Value',0):.1f}")
     c3.metric("Quality", f"{parts.get('Quality',0):.1f}")
     c4.metric("Momentum", f"{parts.get('Momentum',0):.1f}")
-    st.success(f"**{verdict}** — simple composite of V/Q/M.")
+    st.success(f"**{verdict}** — composite of Value/Quality/Momentum.")
 
     # Price chart
     if not price_df.empty:
@@ -585,7 +589,7 @@ if mode == "Single Ticker":
             ])
             st.dataframe(bench, use_container_width=True)
         else:
-            st.info("No peer data available (Yahoo may be rate-limiting).")
+            st.info("No peer data available right now (Yahoo may be rate-limiting).")
 
     # DCF
     st.markdown("### DCF (simple)")
@@ -665,7 +669,7 @@ else:
         cmp_df = pd.DataFrame(results)
         st.dataframe(cmp_df, use_container_width=True)
 
-        # Normalized price chart (last=100)
+        # Normalized price chart (last = 100)
         if charts:
             st.markdown("### Normalized Prices (last = 100)")
             parts = []
