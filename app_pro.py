@@ -1,4 +1,4 @@
-# app_pro.py — 9.2 refresh: Run button, sticky summary, tooltips, number suffixes, Data Issues, smart flags
+# app_pro.py — 9.2 + External Signals + Altman Z + Beneish M-Score
 import io
 import math
 import time
@@ -19,7 +19,6 @@ st.set_page_config(page_title="Naked Fundamentals PRO", layout="wide")
 # ==============
 
 def _num_suffix(x: Optional[float], pct: bool=False) -> str:
-    """Pretty number: 1234000000 -> 1.23B; supports pct."""
     if x is None:
         return "—"
     try:
@@ -133,7 +132,9 @@ def fetch_all(ticker: str, hist_period: str="1y"):
     if not info.get("currentPrice") or not info.get("marketCap") or not info.get("sector") or not info.get("industry"):
         try:
             i = _with_retries(_full_info)
-            for k in ["currentPrice","marketCap","beta","dividendYield","sector","industry","shortName","longName","sharesOutstanding"]:
+            for k in ["currentPrice","marketCap","beta","dividendYield","sector","industry","shortName","longName","sharesOutstanding",
+                      "targetMeanPrice","targetLowPrice","targetHighPrice","numberOfAnalystOpinions","recommendationMean","recommendationKey",
+                      "sharesShort","shortPercentOfFloat","shortRatio"]:
                 if k in i and info.get(k) is None: info[k]=i.get(k)
         except Exception: pass
     def _get_attr(name):
@@ -163,7 +164,7 @@ def fetch_history_only(ticker: str, hist_period: str="1y"):
         return pd.DataFrame()
 
 # ==============
-# Features
+# Core features
 # ==============
 
 def build_core(ticker: str, info: dict, inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFrame) -> Core:
@@ -259,13 +260,11 @@ def momentum_and_prices(hist: pd.DataFrame, bench_hist: pd.DataFrame=None):
     out["hi_52w"] = float(close.tail(252).max()) if len(close)>=252 else None
     out["px_vs_52w_hi"] = (out["price"]/out["hi_52w"] - 1.0) if (out.get("price") and out.get("hi_52w")) else None
 
-    # Vol & Drawdown
     daily = close.pct_change().dropna()
     out["vol_1y"] = float(daily.std()*np.sqrt(252)) if not daily.empty else None
     roll_max = close.cummax(); dd = (close/roll_max - 1.0).min() if not close.empty else None
     out["max_dd_1y"] = float(dd) if dd is not None else None
 
-    # Relative strength vs benchmark
     if isinstance(bench_hist,pd.DataFrame) and not bench_hist.empty and "Close" in bench_hist:
         b = bench_hist["Close"].reindex(close.index).ffill().dropna()
         if not b.empty and len(b)==len(close):
@@ -280,7 +279,8 @@ def simple_score(core: Core, mom: Dict[str,float]) -> Tuple[float, Dict[str,floa
     parts={}
     v=0.0
     if core.pe and core.pe>0: v += max(0, min(30, (30 - core.pe)))/30*30
-    if core.ev_ebitda and core.ev_ebitda>0: v += max(0, min(20, (20 - core.ev_ebitda)))/20*20
+    if core.ev_ebitda and core.ev_ebda>0 if False else core.ev_ebitda and core.ev_ebitda>0:  # guard
+        v += max(0, min(20, (20 - core.ev_ebitda)))/20*20
     if core.fcf_yield: v += max(0, min(25, core.fcf_yield*100))
     parts["Value"]=v
     q=0.0
@@ -320,7 +320,125 @@ def piotroski_f(inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFrame):
         available+=1; ok=(sales_t/assets_t) >= (sales_p/assets_p); score+=int(ok); details.append(("Asset turnover improving",ok))
     return score, available, details
 
-def smart_flags(core: Core, inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFrame, mom: Dict[str,float]):
+# ---------- Altman Z (3 variants) ----------
+def _div(a, b):
+    try:
+        if a is None or b in (None, 0): return None
+        return float(a)/float(b)
+    except Exception:
+        return None
+
+def altman_z(core: Core, inc: pd.DataFrame, bal: pd.DataFrame, info: dict):
+    wc = ( _latest_value(bal,["total current assets"]) or 0 ) - ( _latest_value(bal,["total current liabilities"]) or 0 )
+    ta = _latest_value(bal,["total assets"])
+    re = _latest_value(bal,["retained earnings"])
+    ebit = _latest_value(inc,["ebit","operating income"])
+    tl = _latest_value(bal,["total liab"])
+    sales = _latest_value(inc,["total revenue","revenue"])
+    mve = core.mktcap or None
+    be = _latest_value(bal,["total stockholder","total shareholders'","total equity"])
+
+    X1 = _div(wc, ta)
+    X2 = _div(re, ta)
+    X3 = _div(ebit, ta)
+    X4m = _div(mve, tl)
+    X4b = _div(be, tl)
+    X5 = _div(sales, ta)
+
+    Z  = 1.2*(X1 or 0) + 1.4*(X2 or 0) + 3.3*(X3 or 0) + 0.6*(X4m or 0) + 1.0*(X5 or 0) if None not in (X1,X2,X3,X4m,X5) else None
+    Zp = 0.717*(X1 or 0) + 0.847*(X2 or 0) + 3.107*(X3 or 0) + 0.420*(X4b or 0) + 0.998*(X5 or 0) if None not in (X1,X2,X3,X4b,X5) else None
+    Zpp= 6.56*(X1 or 0) + 3.26*(X2 or 0) + 6.72*(X3 or 0) + 1.05*(X4b or 0) if None not in (X1,X2,X3,X4b) else None
+
+    # zone helper
+    def zone(z, safe, grey):
+        if z is None: return "n/a"
+        if z > safe: return "safe"
+        if z >= grey: return "grey"
+        return "distress"
+
+    # pick recommended variant (basic heuristic)
+    sector = (info.get("sector") or "").lower()
+    industry = (info.get("industry") or "").lower()
+    fin_like = any(s in sector for s in ["financial"])
+    fin_like |= any(s in industry for s in ["reit","bank","insurance"])
+    if fin_like:
+        rec_variant = "N/A (financials not suitable)"
+        rec_z, rec_zone = None, "n/a"
+    else:
+        if any(s in industry for s in ["manufactur","semiconductor","automobile","hardware"]) or "industrials" in sector:
+            rec_variant = "Z (public mfg)"; rec_z = Z; rec_zone = zone(rec_z, 2.99, 1.81)
+        else:
+            rec_variant = "Z'' (non-mfg)"; rec_z = Zpp; rec_zone = zone(rec_z, 2.60, 1.10)
+
+    return {
+        "Z": Z, "Z_zone": zone(Z, 2.99, 1.81),
+        "Z'": Zp, "Z'_zone": zone(Zp, 2.90, 1.23),
+        "Z''": Zpp, "Z''_zone": zone(Zpp, 2.60, 1.10),
+        "recommended": {"variant": rec_variant, "z": rec_z, "zone": rec_zone}
+    }
+
+# ---------- Beneish M-Score ----------
+def beneish_m(inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFrame):
+    # pull t and t-1
+    sales_t, sales_p = _latest_prev(inc, ["total revenue","revenue"])
+    ar_t, ar_p = _latest_prev(bal, ["accounts receivable"])
+    gp_t, gp_p = _latest_prev(inc, ["gross profit"])
+    sga_t, sga_p = _latest_prev(inc, ["selling general","sga","selling, general"])
+    ta_t, ta_p = _latest_prev(bal, ["total assets"])
+    ca_t, ca_p = _latest_prev(bal, ["total current assets"])
+    ppe_t, ppe_p = _latest_prev(bal, ["property plant equipment","net ppe","property, plant"])
+    dep_t, dep_p = _latest_prev(cfs, ["depreciation","depreciation & amortization","depreciation/amortization"])
+    ni_t, _ = _latest_prev(inc, ["net income"])
+    cfo_t, _ = _latest_prev(cfs, ["operating cash flow","total cash from operating activities"])
+    debt_t, debt_p = _latest_prev(bal, ["total debt","long term debt","long-term debt"])
+
+    # ratios
+    def div(a,b):
+        try:
+            if a is None or b in (None,0): return None
+            return float(a)/float(b)
+        except Exception: return None
+
+    dsri = div(div(ar_t, sales_t), div(ar_p, sales_p))
+    gmi = None
+    if gp_t is not None and sales_t and gp_p is not None and sales_p:
+        gm_t = div(gp_t, sales_t); gm_p = div(gp_p, sales_p)
+        if gm_t not in (None,0): gmi = div(gm_p, gm_t)
+    aqi = None
+    if ta_t and ca_t is not None and ppe_t is not None and ta_p and ca_p is not None and ppe_p is not None:
+        nca_t = ta_t - ca_t - ppe_t; nca_p = ta_p - ca_p - ppe_p
+        aqi = div(div(nca_t, ta_t), div(nca_p, ta_p))
+    sgi = div(sales_t, sales_p)
+    depi = None
+    if dep_t and ppe_t is not None and dep_p and ppe_p is not None:
+        rate_t = div(dep_t, dep_t + ppe_t); rate_p = div(dep_p, dep_p + ppe_p)
+        if rate_t not in (None,0): depi = div(rate_p, rate_t)
+    sgai = None
+    if sga_t is not None and sales_t and sga_p is not None and sales_p:
+        sgai = div(div(sga_t, sales_t), div(sga_p, sales_p))
+    lvgi = None
+    if debt_t is not None and ta_t and debt_p is not None and ta_p:
+        lvgi = div(div(debt_t, ta_t), div(debt_p, ta_p))
+    tata = None
+    if ni_t is not None and cfo_t is not None and ta_t:
+        tata = div(ni_t - cfo_t, ta_t)
+
+    comps = {"DSRI": dsri, "GMI": gmi, "AQI": aqi, "SGI": sgi, "DEPI": depi, "SGAI": sgai, "LVGI": lvgi, "TATA": tata}
+    have = [k for k,v in comps.items() if v is not None]
+    M = None
+    if len(have) >= 6:
+        M = (-4.84 +
+             0.920*(dsri or 0) +
+             0.528*(gmi or 0) +
+             0.404*(aqi or 0) +
+             0.892*(sgi or 0) +
+             0.115*(depi or 0) -
+             0.172*(sgai or 0) +
+             4.679*(tata or 0) -
+             0.327*(lvgi or 0))
+    return M, comps, have
+
+def smart_flags(core: Core, inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFrame, mom: Dict[str,float], z_data=None, mscore=None):
     flags=[]
     def add(level,title,detail): flags.append({"level":level,"title":title,"detail":detail})
     if core.revenue is None or core.ebit is None or core.equity is None:
@@ -329,7 +447,7 @@ def smart_flags(core: Core, inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFr
     cfo = _latest_value(cfs, ["operating cash flow","total cash from operating activities"])
     if core.net_income and cfo is not None and cfo < 0 <= core.net_income:
         add("red","Earnings quality risk","Positive net income but negative operating cash flow in latest period.")
-    # DSRI
+    # DSRI-like check
     ar_t, ar_p = _latest_prev(bal, ["accounts receivable"])
     sales_t, sales_p = _latest_prev(inc, ["total revenue","revenue"])
     if ar_t and sales_t and ar_p and sales_p and sales_p!=0 and sales_t!=0:
@@ -346,10 +464,9 @@ def smart_flags(core: Core, inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFr
     assets = _latest_value(bal, ["total assets"])
     if core.goodwill and assets and core.goodwill/assets > 0.4:
         add("orange","High goodwill share of assets",">40% of assets are goodwill; future impairments possible.")
-    # Liquidity
+    # Liquidity/leverage/coverage
     if core.current_ratio and core.current_ratio < 1.0: add("orange","Tight liquidity","Current ratio < 1.0")
     if core.quick_ratio and core.quick_ratio < 1.0: add("orange","Low quick ratio","Quick ratio < 1.0")
-    # Leverage & coverage
     if core.de and core.de > 2.0: add("orange","High leverage","Debt/Equity > 2")
     if core.int_cov and core.int_cov < 2.0: add("orange","Weak interest coverage","EBIT/Interest < 2")
     # Profitability stress
@@ -362,6 +479,14 @@ def smart_flags(core: Core, inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFr
         add("orange","Deep drawdown","Max drawdown worse than -30% in last year.")
     if mom.get("vol_1y") is not None and mom["vol_1y"] > 0.6:
         add("info","Very high volatility","Annualized volatility > 60%")
+    # Altman distress
+    if z_data and isinstance(z_data, dict):
+        rec = z_data.get("recommended", {})
+        if rec.get("z") is not None and rec.get("zone") == "distress":
+            add("red", f"Altman {rec.get('variant')} distress", f"Z ≈ {rec.get('z'):.2f} ({rec.get('zone')}).")
+    # Beneish risk
+    if mscore is not None and mscore > -1.78:
+        add("orange","Beneish M-Score elevated","M > -1.78 → higher manipulation risk (statistical).")
     return flags
 
 def collect_data_issues(info: dict, inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFrame) -> List[str]:
@@ -375,6 +500,7 @@ def collect_data_issues(info: dict, inc: pd.DataFrame, bal: pd.DataFrame, cfs: p
     chk(bal, ["total stockholder","total shareholders'","total equity"], "Shareholders' Equity (BS)")
     chk(bal, ["total assets"], "Total Assets (BS)")
     chk(bal, ["total debt","long term debt","long-term debt"], "Total Debt (BS)")
+    chk(bal, ["total liab"], "Total Liabilities (BS)")
     chk(cfs, ["operating cash flow","total cash from operating activities"], "Operating Cash Flow (CF)")
     chk(cfs, ["free cash flow","free cash flow to the firm"], "Free Cash Flow (CF)")
     return issues
@@ -400,6 +526,179 @@ def simple_dcf(core: Core, rf: float, mkt_prem: float, term_growth: float, years
                        "DF": [1/((1+wacc)**t) for t in range(1,years+1)]})
     return df, per_share or 0.0
 
+# ==============
+# External signals
+# ==============
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def news_sentiment(ticker: str, days: int=14) -> Optional[float]:
+    try:
+        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    except Exception:
+        return None
+    try:
+        t = yf.Ticker(ticker)
+        news = getattr(t, "news", None) or []
+        if not news: return None
+        cutoff = pd.Timestamp.utcnow().timestamp() - days*24*3600
+        titles = [n.get("title") for n in news if n.get("providerPublishTime",0) >= cutoff]
+        if not titles: return None
+        vs = SentimentIntensityAnalyzer()
+        scores = [vs.polarity_scores(tt)["compound"] for tt in titles if tt]
+        return float(np.mean(scores)) if scores else None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def analyst_signals(ticker: str, info_fallback: dict) -> Dict:
+    out = {}
+    t = yf.Ticker(ticker)
+    rec_df = None
+    try:
+        if hasattr(t, "get_recommendations"):
+            rec_df = t.get_recommendations()
+        elif hasattr(t, "recommendations"):
+            rec_df = t.recommendations
+    except Exception:
+        rec_df = None
+    if isinstance(rec_df, pd.DataFrame) and not rec_df.empty:
+        try:
+            recent = rec_df.sort_index().last("90D")
+            if not recent.empty and "To Grade" in recent:
+                tg = recent["To Grade"].astype(str)
+                out["recs_90d"] = {
+                    "buy": int(tg.str.contains("Buy", case=False).sum()),
+                    "hold": int(tg.str.contains("Hold", case=False).sum()),
+                    "sell": int(tg.str.contains("Sell", case=False).sum()),
+                }
+        except Exception:
+            pass
+    for k in ["targetMeanPrice","targetLowPrice","targetHighPrice","numberOfAnalystOpinions","recommendationMean","recommendationKey"]:
+        if info_fallback.get(k) is not None:
+            out[k] = info_fallback.get(k)
+    return out
+
+@st.cache_data(ttl=900, show_spinner=False)
+def options_signals(ticker: str, last_price: Optional[float]) -> Optional[Dict[str,float]]:
+    if not last_price: return None
+    try:
+        t = yf.Ticker(ticker)
+        exps = t.options or []
+        if not exps: return None
+        oc = t.option_chain(exps[0])
+        calls, puts = getattr(oc, "calls", None), getattr(oc, "puts", None)
+        if calls is None or puts is None or calls.empty or puts.empty:
+            return None
+        idx_c = (calls["strike"]-last_price).abs().idxmin()
+        idx_p = (puts["strike"]-last_price).abs().idxmin()
+        atm_iv = float(np.nanmean([calls.loc[idx_c,"impliedVolatility"], puts.loc[idx_p,"impliedVolatility"]]))
+        pcr_oi = float(puts["openInterest"].sum() / max(1, calls["openInterest"].sum()))
+        pcr_vol = float(puts["volume"].sum() / max(1, calls["volume"].sum()))
+        k_dn = last_price*0.9; k_up = last_price*1.1
+        iv_dn = float(puts.iloc[(puts["strike"]-k_dn).abs().idxmin()]["impliedVolatility"])
+        iv_up = float(calls.iloc[(calls["strike"]-k_up).abs().idxmin()]["impliedVolatility"])
+        skew10 = iv_dn - atm_iv
+        return {"atm_iv": atm_iv, "pcr_oi": pcr_oi, "pcr_vol": pcr_vol, "skew10": skew10}
+    except Exception:
+        return None
+
+def short_interest(info: dict) -> Dict[str, Optional[float]]:
+    return {
+        "sharesShort": _safe_float(info.get("sharesShort")),
+        "shortPercentFloat": _safe_float(info.get("shortPercentOfFloat")),
+        "daysToCover": _safe_float(info.get("shortRatio")),
+    }
+
+# ==============
+# Recommendation engine
+# ==============
+
+def multiples_fair_values(core: Core, peer_meds: Dict[str,float]):
+    out = {}
+    eps = (core.net_income or 0) / (core.shares_out or 1) if core.shares_out else None
+    if eps and peer_meds.get("P/E"):
+        out["PE"] = eps * peer_meds["P/E"]
+    if core.ebitda and peer_meds.get("EV/EBITDA"):
+        ev = core.ebitda * peer_meds["EV/EBITDA"]
+        eq = ev - ((core.debt or 0) - (core.cash or 0))
+        if core.shares_out:
+            out["EVEBITDA"] = eq / core.shares_out
+    return out
+
+def combine_fair_value(dcf_px: Optional[float], mults_dict: Dict[str,float], roic: Optional[float]=None):
+    vals = [v for v in [dcf_px] + list(mults_dict.values()) if v]
+    if not vals:
+        return None, None, None
+    lo, hi = min(vals), max(vals)
+    mean = float(np.median(vals))
+    return lo, mean, hi
+
+def adjust_mos(base_mos: float,
+               sentiment: Optional[float],
+               analyst: Dict,
+               opt_sig: Optional[Dict[str,float]],
+               si: Dict[str,Optional[float]],
+               price: Optional[float]) -> float:
+    mos = base_mos
+    if sentiment is not None:
+        if sentiment >= 0.2: mos = max(0.05, mos - 0.03)
+        elif sentiment <= -0.2: mos = min(0.4, mos + 0.05)
+    if analyst:
+        rec_mean = _safe_float(analyst.get("recommendationMean"))
+        tgt = _safe_float(analyst.get("targetMeanPrice"))
+        prem = (tgt/price - 1.0) if (price and tgt) else None
+        if rec_mean is not None:
+            if rec_mean <= 2.5 and (prem is None or prem >= 0.05):
+                mos = max(0.05, mos - 0.02)
+            if rec_mean >= 3.5 or (prem is not None and prem <= -0.10):
+                mos = min(0.5, mos + 0.03)
+    if opt_sig:
+        if opt_sig.get("pcr_oi", 0) > 1.5: mos = min(0.5, mos + 0.03)
+        if opt_sig.get("atm_iv", 0) > 0.6: mos = min(0.5, mos + 0.03)
+        if opt_sig.get("skew10", 0) > 0.10: mos = min(0.5, mos + 0.02)
+        if opt_sig.get("pcr_oi", 0) < 0.7 and opt_sig.get("skew10", 0) < -0.05:
+            mos = max(0.05, mos - 0.02)
+    if si:
+        if (si.get("shortPercentFloat") or 0) > 0.15: mos = min(0.6, mos + 0.05)
+        if (si.get("daysToCover") or 0) > 5: mos = min(0.6, mos + 0.03)
+    return mos
+
+def recommend_bands(core: Core,
+                    dcf_px: Optional[float],
+                    peer_meds: Dict[str,float],
+                    mom: Dict[str,float],
+                    sentiment: Optional[float],
+                    analyst: Dict,
+                    opt_sig: Optional[Dict[str,float]],
+                    si: Dict[str,Optional[float]],
+                    base_mos=0.20, trim=0.15, red_flags=False):
+    mults = multiples_fair_values(core, peer_meds or {})
+    lo, fair, hi = combine_fair_value(dcf_px, mults, core.roic)
+    if fair is None:
+        return None
+    mos = base_mos + (0.10 if red_flags else 0.0)
+    mos = adjust_mos(mos, sentiment, analyst, opt_sig, si, core.price)
+
+    buy_px  = fair * (1 - mos)
+    sell_px = fair * (1 + trim)
+
+    timing_ok = False
+    if mom:
+        timing_ok = ((mom.get("sma50") and mom.get("sma200") and mom["sma50"] >= mom["sma200"]) or
+                     (mom.get("price") and mom.get("sma50") and mom["price"] >= mom["sma50"]) or
+                     (mom.get("rs_6m") is not None and mom["rs_6m"] > 0))
+    return {
+        "fair_low": lo, "fair_mid": fair, "fair_high": hi,
+        "buy_below": buy_px, "trim_above": sell_px,
+        "timing_ok": timing_ok,
+        "used_mults": mults,
+        "mos": mos
+    }
+
+# ==============
+# Analyze wrapper
+# ==============
+
 def analyze_one(ticker: str, hist_period: str, bench: str, rf: float, mkt_prem: float, term_g: float):
     info, inc, bal, cfs, hist = fetch_all(ticker, hist_period)
     bench_hist = fetch_history_only(bench, hist_period)
@@ -407,30 +706,32 @@ def analyze_one(ticker: str, hist_period: str, bench: str, rf: float, mkt_prem: 
     mom, price_df = momentum_and_prices(hist, bench_hist)
     score, parts, verdict = simple_score(core, mom)
     dcf_table, dcf_px = simple_dcf(core, rf, mkt_prem, term_g, years=5)
+    alt = altman_z(core, inc, bal, info)
+    M, mcomps, m_have = beneish_m(inc, bal, cfs)
     f_score, f_avail, f_details = piotroski_f(inc, bal, cfs)
-    flags = smart_flags(core, inc, bal, cfs, mom)
+    flags = smart_flags(core, inc, bal, cfs, mom, z_data=alt, mscore=M)
     issues = collect_data_issues(info, inc, bal, cfs)
     cap = {"Market Cap": core.mktcap, "Enterprise Value": (core.ev or None), "Debt": core.debt,
            "Cash": core.cash, "Net Debt": (core.debt or 0)-(core.cash or 0), "Shares Out": core.shares_out}
-    return core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px, f_score, f_avail, f_details, flags, issues
+    return core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px, alt, M, mcomps, f_score, f_avail, f_details, flags, issues, info
 
 # ============================
 # UI (Run-gated & sticky summary)
 # ============================
 
 st.title("🧠 Naked Fundamentals PRO — Analyst Dashboard")
-st.caption("Fundamentals • V/Q/M • DCF • Forensics & Smart Flags • Export")
+st.caption("Fundamentals • V/Q/M • DCF • Forensics (Piotroski, Altman, Beneish) • External Signals • Export")
 
 with st.sidebar:
     st.header("Controls")
     mode = st.radio("Mode", ["Single Ticker","Compare 3"], index=0,
                     help="Single security deep dive or side-by-side comparison.")
     hist_period = st.selectbox("Price History Period", ["1y","3y","5y"], index=0,
-                               help="Span to compute momentum, drawdown and moving averages.")
+                               help="Span for momentum & MAs.")
     bench = st.selectbox("Benchmark (for RS)", ["SPY","QQQ","IWM"], index=0,
                          help="Relative strength is computed vs this benchmark.")
     if mode=="Single Ticker":
-        tk1 = st.text_input("Ticker", "AAPL", help="Symbol as used on Yahoo Finance.").upper().strip()
+        tk1 = st.text_input("Ticker", "AAPL", help="Symbol on Yahoo Finance.").upper().strip()
     else:
         tk1 = st.text_input("Ticker 1", "AAPL").upper().strip()
         tk2 = st.text_input("Ticker 2", "MSFT").upper().strip()
@@ -439,24 +740,30 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Valuation Settings")
     rf = st.number_input("Risk-free rate (rf)", value=0.045, step=0.005, format="%.3f",
-                         help="Annualized risk-free rate used in CAPM and WACC.")
+                         help="Annual risk-free rate used in CAPM/WACC.")
     mkt_prem = st.number_input("Market risk premium", value=0.055, step=0.005, format="%.3f",
-                               help="Equity risk premium added to rf × beta to get cost of equity.")
+                               help="Equity risk premium × beta is added to rf.")
     term_g = st.number_input("Terminal growth", value=0.020, step=0.002, format="%.3f",
-                             help="Long-run growth rate for terminal value. Must be below WACC.")
+                             help="Long-run growth for terminal value.")
 
     st.markdown("---")
     peer_str = st.text_input("Peers (optional)", "",
                              help="Comma-separated list for peer medians (P/E, EV/EBITDA, ROIC, etc.).")
 
     st.markdown("---")
+    st.subheader("External Signals")
+    use_news = st.checkbox("News sentiment (VADER)", value=True, help="Scores recent Yahoo headlines (−1 to +1).")
+    use_analyst = st.checkbox("Analyst consensus & targets", value=True, help="From yfinance info + recommendations feed.")
+    use_options = st.checkbox("Options / IV signals", value=True, help="ATM IV, put/call ratios, 10% OTM skew.")
+    use_short = st.checkbox("Short interest", value=True, help="Short % of float and days-to-cover (if available).")
+
+    st.markdown("---")
     colb1, colb2 = st.columns(2)
     run_clicked = colb1.button("▶️ Run analysis", type="primary", help="Click to fetch & compute.")
-    if colb2.button("♻️ Hard refresh (clear cache)", help="Clears Streamlit cache (data & peers)."):
+    if colb2.button("♻️ Hard refresh (clear cache)", help="Clears Streamlit cache."):
         st.cache_data.clear()
         st.success("Cache cleared. Click Run analysis again.")
 
-    # Environment readout
     try:
         import sys
         st.caption(f"Py {sys.version.split()[0]} • pandas {pd.__version__} • numpy {np.__version__} • yfinance {getattr(yf,'__version__','?')}")
@@ -499,14 +806,15 @@ if mode=="Single Ticker":
 
     started = pd.Timestamp.utcnow()
     with st.spinner(f"Fetching {tk1}..."):
-        core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px, f_score, f_avail, f_details, flags, issues = analyze_one(
+        (core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px,
+         alt, M, mcomps, f_score, f_avail, f_details, flags, issues, info) = analyze_one(
             tk1, hist_period, bench, rf, mkt_prem, term_g
         )
 
     _summary_bar(tk1, core.name or "", core.price, score, verdict)
     st.caption(f"Source: yfinance • Retrieved at {started.strftime('%Y-%m-%d %H:%M')} UTC")
 
-    # Headline metrics (mouse-over via title attributes in sticky bar; below are regular metrics)
+    # Headline metrics
     colA, colB, colC, colD = st.columns(4)
     colA.metric("Price", _num_suffix(core.price))
     colB.metric("Market Cap", _num_suffix(core.mktcap))
@@ -530,7 +838,7 @@ if mode=="Single Ticker":
         else:
             st.info("No data gaps detected in key lines for the latest two periods.")
 
-    # Price chart with better hover
+    # Price chart
     if not price_df.empty:
         st.markdown("### Price & Moving Averages")
         fig = px.line(price_df, x="Date", y=["Close","SMA50","SMA200"])
@@ -545,7 +853,7 @@ if mode=="Single Ticker":
     m3.metric(f"RS vs {bench} (6m)", _num_suffix(mom.get("rs_6m"), pct=True) if mom.get("rs_6m") is not None else "—")
     m4.metric(f"RS vs {bench} (12m)", _num_suffix(mom.get("rs_12m"), pct=True) if mom.get("rs_12m") is not None else "—")
 
-    # Key Fundamentals table with tooltips
+    # Key Fundamentals with tooltips
     st.markdown("### Key Fundamentals")
     rows = [
         ("Sector", core.sector, "Company sector classification"),
@@ -574,7 +882,7 @@ if mode=="Single Ticker":
         column_config={
             "Metric": st.column_config.TextColumn("Metric", help="Name of the ratio/line item."),
             "Value": st.column_config.TextColumn("Value", help="Formatted with K/M/B/T and % where relevant."),
-            "ⓘ": st.column_config.TextColumn("What this means", help="Hover the cell to read the quick explanation."),
+            "ⓘ": st.column_config.TextColumn("What this means", help="Hover the cell for a quick explanation."),
         }
     )
 
@@ -583,21 +891,34 @@ if mode=="Single Ticker":
     cap_df = pd.DataFrame({"Metric": list(cap.keys()), "Value": [_num_suffix(v) for v in cap.values()]})
     st.dataframe(cap_df, use_container_width=True)
 
-    # Forensics — Piotroski & Flags
+    # Forensics — Piotroski, Altman, Beneish + Flags
     st.markdown("### Forensics")
-    fcol1, fcol2 = st.columns([1,2])
-    fcol1.metric("Piotroski F-Score", f"{f_score}/{f_avail}" if f_avail else "—")
+    lf, rf_cols = st.columns([1,2])
+
+    # Piotroski
+    lf.metric("Piotroski F-Score", f"{f_score}/{f_avail}" if f_avail else "—")
     if f_avail:
         f_tbl = pd.DataFrame([{"Check": n, "Pass": "✅" if ok else "❌"} for n, ok in f_details])
-        fcol1.dataframe(f_tbl, use_container_width=True, hide_index=True)
+        lf.dataframe(f_tbl, use_container_width=True, hide_index=True)
+
+    # Altman & Beneish table
+    ab_rows = []
+    ab_rows.append({"Model":"Altman Z (public mfg)", "Score": f"{alt.get('Z'):.2f}" if alt.get("Z") is not None else "—", "Zone": alt.get("Z_zone")})
+    ab_rows.append({"Model":"Altman Z′ (private mfg)", "Score": f"{alt.get(\"Z'\"):.2f}" if alt.get("Z'") is not None else "—", "Zone": alt.get("Z'_zone")})
+    ab_rows.append({"Model":"Altman Z″ (non-mfg)", "Score": f"{alt.get('Z'''):.2f}" if alt.get("Z''") is not None else "—", "Zone": alt.get("Z''_zone")})
+    ab_rows.append({"Model":"Beneish M-Score", "Score": f"{M:.2f}" if M is not None else "—", "Zone": "≥ -1.78 = elevated"})
+    rf_cols.dataframe(pd.DataFrame(ab_rows), use_container_width=True, hide_index=True)
+
+    # Flags
     if flags:
         sev_map = {"red":"🔴","orange":"🟠","info":"🔵"}
         flags_df = pd.DataFrame([{"Severity": sev_map.get(f["level"],"🔵"), "Flag": f["title"], "Details": f["detail"]} for f in flags])
-        fcol2.dataframe(flags_df, use_container_width=True, hide_index=True)
+        rf_cols.dataframe(flags_df, use_container_width=True, hide_index=True)
     else:
-        fcol2.info("No red/orange flags detected with current data.")
+        rf_cols.info("No red/orange flags detected with current data.")
 
-    # Peer Medians (optional)
+    # Peer Medians (optional) for multiples
+    peer_meds = {}
     if peer_str.strip():
         st.markdown("### Peer Medians")
         peers = sorted({p.strip().upper() for p in peer_str.split(",") if p.strip()})
@@ -605,27 +926,25 @@ if mode=="Single Ticker":
         def _peer_meds(peers_list: List[str]) -> Dict[str,float]:
             rows=[]
             for p in peers_list:
-                info, inc, bal, cfs, _ = fetch_all(p, "1y")
-                c = build_core(p, info, inc, bal, cfs)
-                rows.append({"P/E": c.pe, "EV/EBITDA": c.ev_ebitda, "P/S": c.ps, "P/B": c.pb,
-                             "Debt/Equity": c.de, "FCF Yield": c.fcf_yield, "ROIC": c.roic})
+                info2, inc2, bal2, cfs2, _ = fetch_all(p, "1y")
+                c2 = build_core(p, info2, inc2, bal2, cfs2)
+                rows.append({"P/E": c2.pe, "EV/EBITDA": c2.ev_ebitda, "P/S": c2.ps, "P/B": c2.pb,
+                             "Debt/Equity": c2.de, "FCF Yield": c2.fcf_yield, "ROIC": c2.roic})
             if not rows: return {}
             return pd.DataFrame(rows).median(numeric_only=True).to_dict()
         with st.spinner("Fetching peers..."):
-            meds = _peer_meds(peers)
-        if meds:
-            bench = pd.DataFrame([
-                {"Metric":"P/E", "Company":core.pe, "Peers (Median)":meds.get("P/E")},
-                {"Metric":"EV/EBITDA", "Company":core.ev_ebitda, "Peers (Median)":meds.get("EV/EBITDA")},
-                {"Metric":"P/S", "Company":core.ps, "Peers (Median)":meds.get("P/S")},
-                {"Metric":"P/B", "Company":core.pb, "Peers (Median)":meds.get("P/B")},
-                {"Metric":"Debt/Equity", "Company":core.de, "Peers (Median)":meds.get("Debt/Equity")},
-                {"Metric":"FCF Yield", "Company":core.fcf_yield, "Peers (Median)":meds.get("FCF Yield")},
-                {"Metric":"ROIC", "Company":core.roic, "Peers (Median)":meds.get("ROIC")},
+            peer_meds = _peer_meds(peers)
+        if peer_meds:
+            bench_tbl = pd.DataFrame([
+                {"Metric":"P/E", "Company":core.pe, "Peers (Median)":peer_meds.get("P/E")},
+                {"Metric":"EV/EBITDA", "Company":core.ev_ebitda, "Peers (Median)":peer_meds.get("EV/EBITDA")},
+                {"Metric":"P/S", "Company":core.ps, "Peers (Median)":peer_meds.get("P/S")},
+                {"Metric":"P/B", "Company":core.pb, "Peers (Median)":peer_meds.get("P/B")},
+                {"Metric":"Debt/Equity", "Company":core.de, "Peers (Median)":peer_meds.get("Debt/Equity")},
+                {"Metric":"FCF Yield", "Company":core.fcf_yield, "Peers (Median)":peer_meds.get("FCF Yield")},
+                {"Metric":"ROIC", "Company":core.roic, "Peers (Median)":peer_meds.get("ROIC")},
             ])
-            bench["Company"] = bench["Company"].apply(lambda v: _num_suffix(v, pct=("Yield" in str(v) or False)))
-            bench["Peers (Median)"] = bench["Peers (Median)"].apply(lambda v: _num_suffix(v))
-            st.dataframe(bench, use_container_width=True)
+            st.dataframe(bench_tbl, use_container_width=True)
         else:
             st.info("No peer data available right now (source may be rate-limiting).")
 
@@ -634,6 +953,64 @@ if mode=="Single Ticker":
     st.dataframe(dcf_table, use_container_width=True)
     if dcf_px:
         st.info(f"**DCF Fair Value (approx)**: {_num_suffix(dcf_px)} per share")
+
+    # ===== External Signals block =====
+    st.markdown("### External Signals")
+    sig_col1, sig_col2, sig_col3, sig_col4 = st.columns(4)
+
+    sentiment = news_sentiment(tk1) if use_news else None
+    if use_news:
+        sig_col1.metric("News Sentiment (14d)", f"{sentiment:.2f}" if sentiment is not None else "—",
+                        help="VADER compound score averaged over recent Yahoo headlines (−1..+1).")
+
+    analyst = analyst_signals(tk1, info) if use_analyst else {}
+    if use_analyst:
+        rec_mean = analyst.get("recommendationMean")
+        tgt = analyst.get("targetMeanPrice")
+        sig_col2.metric("Analyst Consensus", f"{rec_mean:.2f}" if rec_mean is not None else "—",
+                        help="1=Strong Buy … 5=Sell")
+        sig_col2.metric("Target (mean)", _num_suffix(tgt) if tgt else "—")
+
+    opt_sig = options_signals(tk1, core.price) if use_options else None
+    if use_options:
+        sig_col3.metric("ATM IV (near exp.)", _num_suffix(opt_sig.get("atm_iv"), pct=True) if opt_sig else "—",
+                        help="Implied vol at strike nearest spot.")
+        sig_col3.metric("Put/Call OI", f"{opt_sig.get('pcr_oi'):.2f}" if opt_sig else "—",
+                        help="Put open interest ÷ Call open interest (near expiry).")
+
+    si = short_interest(info) if use_short else {}
+    if use_short:
+        spf = si.get("shortPercentFloat")
+        dtc = si.get("daysToCover")
+        sig_col4.metric("Short % Float", _num_suffix(spf, pct=True) if spf is not None else "—")
+        sig_col4.metric("Days-to-Cover", f"{dtc:.2f}" if dtc is not None else "—",
+                        help="Short interest / average daily volume.")
+
+    # ===== Recommendation bands =====
+    st.markdown("### Recommendation")
+    red_present = any(fl["level"]=="red" for fl in (flags or []))
+    bands = recommend_bands(core, dcf_px, peer_meds, mom, sentiment if use_news else None,
+                            analyst if use_analyst else {}, opt_sig if use_options else None,
+                            si if use_short else {}, base_mos=0.20, trim=0.15, red_flags=red_present)
+    if bands:
+        b1, b2, b3, b4, b5 = st.columns(5)
+        b1.metric("Fair Low", _num_suffix(bands["fair_low"]))
+        b2.metric("Fair Mid", _num_suffix(bands["fair_mid"]))
+        b3.metric("Fair High", _num_suffix(bands["fair_high"]))
+        b4.metric("Buy Below", _num_suffix(bands["buy_below"]), help=f"Margin of Safety ≈ {bands['mos']:.0%}")
+        b5.metric("Trim Above", _num_suffix(bands["trim_above"]))
+        msg = []
+        if core.price and bands["buy_below"] and core.price < bands["buy_below"]:
+            msg.append("Price in **BUY** zone.")
+        if core.price and bands["trim_above"] and core.price > bands["trim_above"]:
+            msg.append("Price in **TRIM/SELL** zone.")
+        if not bands["timing_ok"]:
+            msg.append("Timing filter **not met** (SMA/RS).")
+        if red_present:
+            msg.append("Red forensic flags → stricter MoS applied.")
+        st.info(" • ".join(msg) if msg else "Neutral: between Buy and Trim bands.")
+    else:
+        st.info("Insufficient data to form fair-value bands (need DCF or multiples).")
 
     # Sensitivity grid
     rows=[]
@@ -654,21 +1031,56 @@ if mode=="Single Ticker":
             sanitize_for_excel(cap_df).to_excel(writer, index=False, sheet_name="CapitalAlloc")
             sanitize_for_excel(dcf_table).to_excel(writer, index=False, sheet_name="DCF")
             sanitize_for_excel(sens_df).to_excel(writer, index=False, sheet_name="Sensitivity")
+            # Forensics sheets
             if f_avail:
                 ftbl = pd.DataFrame([{"Check": n, "Pass": bool(ok)} for n, ok in f_details])
                 sanitize_for_excel(ftbl).to_excel(writer, index=False, sheet_name="Piotroski")
+            # Altman
+            alt_df = pd.DataFrame([{
+                "Z": alt.get("Z"), "Z_zone": alt.get("Z_zone"),
+                "Z'": alt.get("Z'"), "Z'_zone": alt.get("Z'_zone"),
+                "Z''": alt.get("Z''"), "Z''_zone": alt.get("Z''_zone"),
+                "Recommended": alt.get("recommended",{}).get("variant"),
+                "Z_rec": alt.get("recommended",{}).get("z"),
+                "Zone_rec": alt.get("recommended",{}).get("zone"),
+            }])
+            sanitize_for_excel(alt_df).to_excel(writer, index=False, sheet_name="Altman")
+            # Beneish
+            m_rows = [{"Component": k, "Value": v} for k,v in mcomps.items()]
+            mdf = pd.DataFrame(m_rows); mdf.loc[len(mdf.index)] = {"Component":"M-Score","Value": M}
+            sanitize_for_excel(mdf).to_excel(writer, index=False, sheet_name="Beneish")
+            # Flags
             if flags:
                 sev_map = {"red":"RED","orange":"ORANGE","info":"INFO"}
                 flag_df = pd.DataFrame([{"Severity": sev_map.get(f["level"],"INFO"), "Flag": f["title"], "Details": f["detail"]} for f in flags])
                 sanitize_for_excel(flag_df).to_excel(writer, index=False, sheet_name="Flags")
-            if issues:
-                iss_df = pd.DataFrame({"Issue": issues})
-                sanitize_for_excel(iss_df).to_excel(writer, index=False, sheet_name="DataIssues")
+            # Prices
             if not price_df.empty:
                 pdf = price_df.copy()
                 if "Date" in pdf.columns and pd.api.types.is_datetime64_any_dtype(pdf["Date"]):
                     pdf["Date"] = pd.to_datetime(pdf["Date"], errors="coerce").dt.tz_localize(None)
                 sanitize_for_excel(pdf).to_excel(writer, index=False, sheet_name="Prices")
+            # Signals & Recommendation
+            sig_rows = []
+            if use_news: sig_rows.append({"Signal":"News Sentiment (14d)","Value": sentiment})
+            if use_analyst:
+                for k,v in analyst.items():
+                    sig_rows.append({"Signal": f"Analyst {k}", "Value": v})
+            if use_options and opt_sig:
+                for k,v in opt_sig.items():
+                    sig_rows.append({"Signal": f"Options {k}", "Value": v})
+            if use_short and si:
+                for k,v in si.items():
+                    sig_rows.append({"Signal": f"Short {k}", "Value": v})
+            if sig_rows:
+                sanitize_for_excel(pd.DataFrame(sig_rows)).to_excel(writer, index=False, sheet_name="Signals")
+            if bands:
+                rec_df = pd.DataFrame([{
+                    "Fair Low": bands["fair_low"], "Fair Mid": bands["fair_mid"], "Fair High": bands["fair_high"],
+                    "Buy Below": bands["buy_below"], "Trim Above": bands["trim_above"],
+                    "Timing OK": bands["timing_ok"], "MoS Applied": bands["mos"]
+                }])
+                sanitize_for_excel(rec_df).to_excel(writer, index=False, sheet_name="Recommendation")
         st.download_button(
             "Download Excel",
             bio.getvalue(),
@@ -701,12 +1113,15 @@ else:
                 tk, res = f.result()
                 if isinstance(res, Exception):
                     st.error(f"{tk}: {res}"); continue
-                core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px, f_score, f_avail, f_details, flags, issues = res
+                (core, dcf_table, mom, price_df, score, parts, verdict, cap, dcf_px,
+                 alt, M, mcomps, f_score, f_avail, f_details, flags, issues, info) = res
                 results.append({
                     "Ticker": tk, "Name": core.name, "Price": _num_suffix(core.price),
                     "Score": round(score,1), "Verdict": verdict, "P/E": _num_suffix(core.pe),
                     "EV/EBITDA": _num_suffix(core.ev_ebitda), "D/E": _num_suffix(core.de),
                     "FCF Yield": _num_suffix(core.fcf_yield, pct=True), "ROIC": _num_suffix(core.roic, pct=True),
+                    "Altman (rec.)": f"{alt.get('recommended',{}).get('z'):.2f}" if alt.get("recommended",{}).get("z") is not None else "—",
+                    "Beneish M": f"{M:.2f}" if M is not None else "—",
                     "F-Score": f"{f_score}/{f_avail}" if f_avail else "—",
                     "Flags (red/orange)": sum(1 for fl in (flags or []) if fl["level"] in ("red","orange"))
                 })
